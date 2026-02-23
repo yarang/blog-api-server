@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # 블로그 루트 경로
-BLOG_ROOT = Path(os.getenv("BLOG_ROOT", Path(__file__).parent.parent))
+BLOG_ROOT = Path(os.getenv("BLOG_REPO_PATH", os.getenv("BLOG_ROOT", Path(__file__).parent.parent)))
 
 
 class GitHandler:
