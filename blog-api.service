@@ -1,0 +1,16 @@
+[Unit]
+Description=Blog API Server
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/var/www/blog-api
+Environment="PATH=/var/www/blog-api/venv/bin"
+ExecStart=/var/www/blog-api/venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
