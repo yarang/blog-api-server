@@ -1,0 +1,15 @@
+[project]
+name = "blog-mcp-client"
+version = "0.1.0"
+description = "MCP client for blog management"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "httpx>=0.25.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[project.scripts]
+blog-mcp = "mcp_blog_client:main"
