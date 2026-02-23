@@ -388,6 +388,95 @@ TocOpen = true
         results.sort(key=lambda x: x["relevance"], reverse=True)
         return {"results": results[:20], "query": query}
 
+    def get_translation_status(self) -> Dict:
+        """번역 상태 확인"""
+        self.git.pull()
+
+        ko_dir = BLOG_REPO_PATH / "content" / "ko" / "post"
+        en_dir = BLOG_REPO_PATH / "content" / "en" / "post"
+
+        ko_posts = set(f.stem for f in ko_dir.glob("*.md")) if ko_dir.exists() else set()
+        en_posts = set(f.stem for f in en_dir.glob("*.md")) if en_dir.exists() else set()
+
+        # 번역 필요한 포스트 (한국어에만 있는 것)
+        needs_translation = ko_posts - en_posts
+
+        # 영어에만 있는 포스트
+        en_only = en_posts - ko_posts
+
+        return {
+            "korean_posts": len(ko_posts),
+            "english_posts": len(en_posts),
+            "needs_translation": list(needs_translation),
+            "needs_translation_count": len(needs_translation),
+            "english_only": list(en_only),
+            "synced": len(needs_translation) == 0 and len(en_only) == 0
+        }
+
+    def sync_translations(self) -> Dict:
+        """한국어/영어 포스트 동기화"""
+        from translator import translator
+
+        self.git.pull()
+
+        status = self.get_translation_status()
+        results = {
+            "translated": [],
+            "failed": [],
+            "skipped": []
+        }
+
+        ko_dir = BLOG_REPO_PATH / "content" / "ko" / "post"
+        en_dir = BLOG_REPO_PATH / "content" / "en" / "post"
+        en_dir.mkdir(parents=True, exist_ok=True)
+
+        for filename in status["needs_translation"]:
+            ko_file = ko_dir / f"{filename}.md"
+            en_file = en_dir / f"{filename}.md"
+
+            if not ko_file.exists():
+                results["skipped"].append(filename)
+                continue
+
+            # 한국어 포스트 읽기
+            ko_content = ko_file.read_text(encoding="utf-8")
+
+            # 번역
+            logger.info(f"Translating {filename}...")
+            trans_result = translator.translate(
+                content=ko_content,
+                source="ko",
+                target="en"
+            )
+
+            if trans_result.get("success"):
+                # 영어 포스트 저장
+                en_file.write_text(trans_result["translated"], encoding="utf-8")
+                results["translated"].append(filename)
+                logger.info(f"Translated: {filename}")
+            else:
+                results["failed"].append({
+                    "filename": filename,
+                    "error": trans_result.get("error")
+                })
+                logger.error(f"Translation failed for {filename}: {trans_result.get('error')}")
+
+        # Git 커밋
+        if results["translated"]:
+            git_result = self.git.commit_and_push(
+                f"Auto-translate {len(results['translated'])} posts to English",
+                [f"content/en/post/*.md"]
+            )
+            results["git"] = git_result
+
+        results["summary"] = {
+            "translated": len(results["translated"]),
+            "failed": len(results["failed"]),
+            "skipped": len(results["skipped"])
+        }
+
+        return results
+
 
 # 전역 인스턴스
 blog_manager = BlogManager()

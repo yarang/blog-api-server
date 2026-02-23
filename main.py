@@ -250,6 +250,29 @@ async def translate(request: TranslateRequest, api_key: str = Depends(verify_api
     return result
 
 
+@app.post("/translate/sync", tags=["Translation"])
+async def translate_sync(api_key: str = Depends(verify_api_key)):
+    """
+    한국어/영어 포스트 동기화
+    - 번역되지 않은 포스트 찾기
+    - 자동 번역 후 저장
+    """
+    if not translator.client:
+        raise HTTPException(
+            status_code=503,
+            detail="Translation service not configured. Set ANTHROPIC_API_KEY."
+        )
+
+    result = blog_manager.sync_translations()
+    return result
+
+
+@app.get("/translate/status", tags=["Translation"])
+async def translation_status(api_key: str = Depends(verify_api_key)):
+    """번역 상태 확인"""
+    return blog_manager.get_translation_status()
+
+
 # ============================================================
 # Error Handlers
 # ============================================================
