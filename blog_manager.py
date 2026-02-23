@@ -137,10 +137,22 @@ class BlogManager:
             self.git.ensure_repo()
 
     def _get_content_dir(self, language: str = "ko") -> Path:
-        """언어별 컨텐츠 디렉토리 반환"""
+        """언어별 컨텐츠 디렉토리 반환
+
+        Hugo Stack 테마 규칙:
+        - defaultContentLanguageInSubdir = false일 때
+        - 기본 언어(ko): content/post/
+        - 다른 언어(en): content/en/post/
+        """
         if language not in SUPPORTED_LANGUAGES:
             raise ValueError(f"Unsupported language: {language}. Supported: {SUPPORTED_LANGUAGES}")
-        return BLOG_REPO_PATH / "content" / language / "post"
+
+        if language == "ko":
+            # 기본 언어는 content/post/ (defaultContentLanguageInSubdir = false)
+            return BLOG_REPO_PATH / "content" / "post"
+        else:
+            # 다른 언어는 content/{lang}/post/
+            return BLOG_REPO_PATH / "content" / language / "post"
 
     def _generate_filename(self, title: str, language: str = "ko") -> str:
         """파일명 생성"""
@@ -392,8 +404,9 @@ TocOpen = true
         """번역 상태 확인"""
         self.git.pull()
 
-        ko_dir = BLOG_REPO_PATH / "content" / "ko" / "post"
-        en_dir = BLOG_REPO_PATH / "content" / "en" / "post"
+        # Stack 테마 구조: 한국어는 content/post/, 영어는 content/en/post/
+        ko_dir = self._get_content_dir("ko")  # content/post/
+        en_dir = self._get_content_dir("en")  # content/en/post/
 
         ko_posts = set(f.stem for f in ko_dir.glob("*.md")) if ko_dir.exists() else set()
         en_posts = set(f.stem for f in en_dir.glob("*.md")) if en_dir.exists() else set()
@@ -426,8 +439,9 @@ TocOpen = true
             "skipped": []
         }
 
-        ko_dir = BLOG_REPO_PATH / "content" / "ko" / "post"
-        en_dir = BLOG_REPO_PATH / "content" / "en" / "post"
+        # Stack 테마 구조: 한국어는 content/post/, 영어는 content/en/post/
+        ko_dir = self._get_content_dir("ko")  # content/post/
+        en_dir = self._get_content_dir("en")  # content/en/post/
         en_dir.mkdir(parents=True, exist_ok=True)
 
         for filename in status["needs_translation"]:
