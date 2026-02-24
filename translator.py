@@ -1,20 +1,24 @@
 """
 LLM 기반 번역 모듈
-Anthropic Claude API를 사용하여 마크다운 포스트를 번역합니다.
+Anthropic Claude API 또는 ZAI API를 사용하여 마크다운 포스트를 번역합니다.
 """
 
 import os
 import re
 import json
-import logging
+import httpx
 from typing import Dict, Optional, Any
-from anthropic import Anthropic
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from logger_config import get_logger
+
+logger = get_logger(__name__)
 
 # 환경 변수
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+ZAI_API_KEY = os.getenv("ZAI_API_KEY")
+# ZAI API는 OpenAI 호환 엔드포인트 사용
+ZAI_BASE_URL = os.getenv("ZAI_BASE_URL", "https://api.zukijourney.com/v1")
+ZAI_MODEL = os.getenv("ZAI_MODEL", "gpt-4o-mini")
 
 # 지원하는 언어 쌍
 SUPPORTED_LANGUAGE_PAIRS = [
@@ -27,10 +31,101 @@ class Translator:
     """LLM 기반 번역기"""
 
     def __init__(self, api_key: str = None):
-        self.api_key = api_key or ANTHROPIC_API_KEY
+        # ZAI API 우선 사용, 없으면 Anthropic 사용
+        if ZAI_API_KEY:
+            self.api_key = ZAI_API_KEY
+            self.base_url = ZAI_BASE_URL
+            self.use_zai = True
+            logger.info("Translation service initialized", extra={
+                "provider": "ZAI",
+                "base_url": self.base_url
+            })
+        else:
+            self.api_key = api_key or ANTHROPIC_API_KEY
+            self.base_url = "https://api.anthropic.com"
+            self.use_zai = False
+            if not self.api_key:
+                logger.warning("ANTHROPIC_API_KEY not set")
+            else:
+                logger.info("Translation service initialized", extra={"provider": "Anthropic"})
+
+    def _call_api(self, model: str, max_tokens: int, messages: list) -> str:
+        """API 호출 (ZAI 또는 Anthropic)"""
         if not self.api_key:
-            logger.warning("ANTHROPIC_API_KEY not set")
-        self.client = Anthropic(api_key=self.api_key) if self.api_key else None
+            raise ValueError("API key not configured")
+
+        logger.debug(f"Calling translation API", extra={"model": model, "max_tokens": max_tokens})
+
+        if self.use_zai:
+            # ZAI API 호출 (OpenAI 호환 형식)
+            url = f"{self.base_url}/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": ZAI_MODEL,
+                "messages": messages,
+                "max_tokens": max_tokens
+            }
+
+            try:
+                response = httpx.post(url, headers=headers, json=payload, timeout=120)
+
+                if response.status_code != 200:
+                    logger.error(f"ZAI Translation API error: {response.status_code}", extra={
+                        "status_code": response.status_code,
+                        "response_text": response.text[:500]
+                    })
+                    raise Exception(f"ZAI API error: {response.status_code} - {response.text}")
+
+                data = response.json()
+                # OpenAI 형식 응답
+                result = data["choices"][0]["message"]["content"]
+                logger.debug("ZAI Translation API call successful", extra={
+                    "response_length": len(result)
+                })
+                return result
+
+            except httpx.TimeoutException:
+                logger.error("ZAI Translation API timeout")
+                raise Exception("Translation API timeout")
+
+        else:
+            # Anthropic API 호출
+            url = f"{self.base_url}/v1/messages"
+            headers = {
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": model,
+                "max_tokens": max_tokens,
+                "messages": messages
+            }
+
+            try:
+                response = httpx.post(url, headers=headers, json=payload, timeout=120)
+
+                if response.status_code != 200:
+                    logger.error(f"Anthropic Translation API error: {response.status_code}", extra={
+                        "status_code": response.status_code,
+                        "response_text": response.text[:500]
+                    })
+                    raise Exception(f"API error: {response.status_code} - {response.text}")
+
+                data = response.json()
+                # Anthropic 형식 응답
+                result = data["content"][0]["text"]
+                logger.debug("Translation API call successful", extra={
+                    "response_length": len(result)
+                })
+                return result
+
+            except httpx.TimeoutException:
+                logger.error("Translation API timeout")
+                raise Exception("Translation API timeout")
 
     def _extract_front_matter(self, content: str) -> tuple[str, str]:
         """front matter와 본문 분리"""
@@ -95,10 +190,10 @@ class Translator:
         Returns:
             번역 결과 딕셔너리
         """
-        if not self.client:
+        if not self.api_key:
             return {
                 "success": False,
-                "error": "Translation service not configured. Set ANTHROPIC_API_KEY."
+                "error": "Translation service not configured. Set API key."
             }
 
         if (source, target) not in SUPPORTED_LANGUAGE_PAIRS:
@@ -146,15 +241,11 @@ Content:
 Provide only the translated text."""
 
         try:
-            response = self.client.messages.create(
+            translated_body = self._call_api(
                 model="claude-3-7-sonnet-20250219",
                 max_tokens=8192,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
+                messages=[{"role": "user", "content": prompt}]
             )
-
-            translated_body = response.content[0].text
 
             # front matter가 있으면 번역된 본문과 결합
             if front_matter:
@@ -166,12 +257,12 @@ Provide only the translated text."""
                     title_prompt = f"""Translate this title to {target_name}. Provide only the translated title without quotes.
 
 Title: {parsed["title"]}"""
-                    title_response = self.client.messages.create(
+                    translated_title = self._call_api(
                         model="claude-3-5-haiku-20241022",
                         max_tokens=256,
                         messages=[{"role": "user", "content": title_prompt}]
                     )
-                    parsed["title"] = title_response.content[0].text.strip().strip('"').strip("'")
+                    parsed["title"] = translated_title.strip().strip('"').strip("'")
 
                 # front matter 재구성
                 translated_front_matter = self._build_front_matter(parsed)
@@ -195,7 +286,7 @@ Title: {parsed["title"]}"""
 
     def translate_title_only(self, title: str, target: str = "en") -> Dict[str, any]:
         """제목만 번역"""
-        if not self.client:
+        if not self.api_key:
             return {
                 "success": False,
                 "error": "Translation service not configured"
@@ -209,7 +300,7 @@ Title: {parsed["title"]}"""
 
 Title: {title}"""
 
-            response = self.client.messages.create(
+            translated = self._call_api(
                 model="claude-3-5-haiku-20241022",
                 max_tokens=256,
                 messages=[{"role": "user", "content": prompt}]
@@ -217,7 +308,7 @@ Title: {title}"""
 
             return {
                 "success": True,
-                "translated": response.content[0].text.strip().strip('"').strip("'")
+                "translated": translated.strip().strip('"').strip("'")
             }
 
         except Exception as e:
