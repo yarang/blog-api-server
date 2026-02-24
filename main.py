@@ -15,19 +15,20 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
+from dotenv import load_dotenv
+
+from logger_config import setup_logging, get_logger, log_with_context
 from auth import verify_api_key
 from blog_manager import blog_manager
 from git_handler import git_handler
 from translator import translator
+from middleware import MonitoringMiddleware
 
-# 로깅
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
+# 환경 변수 로드
 load_dotenv()
+
+# 로깅 설정
+logger = setup_logging(__name__)
 
 
 # ============================================================
@@ -36,11 +37,17 @@ load_dotenv()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Blog API Server starting...")
-    logger.info(f"Repo: {blog_manager.git.repo_path}")
+    logger.info("Blog API Server starting...", extra={"repo_path": str(blog_manager.git.repo_path)})
+    log_with_context(logger, "INFO", "Blog API Server starting",
+                    repo_path=str(blog_manager.git.repo_path),
+                    version="2.0.0")
 
     # 초기 동기화
-    blog_manager.git.pull()
+    sync_result = blog_manager.git.pull()
+    if sync_result:
+        logger.info("Initial git sync completed")
+    else:
+        logger.warning("Initial git sync failed")
 
     yield
 
@@ -65,6 +72,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 모니터링 미들웨어
+app.add_middleware(MonitoringMiddleware)
+
+# 전역 인스턴스 (모니터링 엔드포인트용)
+_monitoring_middleware = MonitoringMiddleware(app)
 
 
 # ============================================================
@@ -100,6 +113,30 @@ class TranslateRequest(BaseModel):
 async def health():
     """서버 상태 (인증 불필요)"""
     return {"status": "healthy", "version": "2.0.0"}
+
+
+@app.get("/metrics", tags=["Monitoring"])
+async def metrics(api_key: str = Depends(verify_api_key)):
+    """
+    서버 메트릭 (인증 필요)
+
+    반환:
+    - total_requests: 총 요청 수
+    - error_count: 에러 수
+    - slow_request_count: 느린 요청 수 (>1초)
+    - error_rate_percent: 에러율
+    - slow_request_rate_percent: 느린 요청 비율
+    """
+    return _monitoring_middleware.get_stats()
+
+
+@app.post("/metrics/reset", tags=["Monitoring"])
+async def reset_metrics(api_key: str = Depends(verify_api_key)):
+    """
+    메트릭 초기화 (인증 필요)
+    """
+    _monitoring_middleware.reset_stats()
+    return {"success": True, "message": "Metrics reset"}
 
 
 @app.get("/", tags=["System"])
@@ -144,6 +181,12 @@ async def get_post(
 @app.post("/posts", tags=["Posts"])
 async def create_post(post: PostCreate, api_key: str = Depends(verify_api_key)):
     """포스트 생성 + Git 동기화"""
+    logger.info(f"Creating post: {post.title[:50]}...", extra={
+        "title": post.title,
+        "language": post.language,
+        "tags": post.tags,
+        "draft": post.draft
+    })
     result = blog_manager.create_post(
         title=post.title,
         content=post.content,
@@ -155,8 +198,16 @@ async def create_post(post: PostCreate, api_key: str = Depends(verify_api_key)):
     )
 
     if not result.get("success"):
+        logger.error(f"Failed to create post: {result.get('error')}", extra={
+            "error": result.get("error"),
+            "title": post.title
+        })
         raise HTTPException(status_code=500, detail=result.get("error"))
 
+    logger.info(f"Post created successfully: {result.get('filename')}", extra={
+        "filename": result.get("filename"),
+        "language": result.get("language")
+    })
     return result
 
 
@@ -257,10 +308,10 @@ async def translate_sync(api_key: str = Depends(verify_api_key)):
     - 번역되지 않은 포스트 찾기
     - 자동 번역 후 저장
     """
-    if not translator.client:
+    if not translator.api_key:
         raise HTTPException(
             status_code=503,
-            detail="Translation service not configured. Set ANTHROPIC_API_KEY."
+            detail="Translation service not configured. Set API key."
         )
 
     result = blog_manager.sync_translations()
@@ -271,6 +322,74 @@ async def translate_sync(api_key: str = Depends(verify_api_key)):
 async def translation_status(api_key: str = Depends(verify_api_key)):
     """번역 상태 확인"""
     return blog_manager.get_translation_status()
+
+
+# ============================================================
+# Endpoints: Mermaid Diagram
+# ============================================================
+
+from translator import mermaid_renderer
+from pydantic import BaseModel
+
+
+class MermaidRenderRequest(BaseModel):
+    code: str = Field(..., min_length=1, description="Mermaid 다이어그램 코드")
+    filename: Optional[str] = Field(None, description="저장할 파일명 (선택)")
+
+
+class MermaidMarkdownRequest(BaseModel):
+    content: str = Field(..., min_length=1, description="마크다운 콘텐츠")
+    output_filename: Optional[str] = Field(None, description="결과 마크다운 파일명 (선택)")
+
+
+@app.post("/mermaid/render", tags=["Mermaid"])
+async def render_mermaid(request: MermaidRenderRequest, api_key: str = Depends(verify_api_key)):
+    """
+    Mermaid 코드를 SVG로 렌더링
+
+    Mermaid CLI가 설치되어 있어야 합니다:
+    npm install -g @mermaid-js/mermaid-cli
+    """
+    result = mermaid_renderer.render(request.code, request.filename)
+
+    if not result.get("success"):
+        raise HTTPException(status_code=500, detail=result.get("error"))
+
+    return result
+
+
+@app.post("/mermaid/render-markdown", tags=["Mermaid"])
+async def render_mermaid_in_markdown(request: MermaidMarkdownRequest, api_key: str = Depends(verify_api_key)):
+    """
+    마크다운의 Mermaid 코드블록을 SVG로 변환
+
+    마크다운 내의 ```mermaid ... ``` 코드블록을 찾아
+    SVG로 렌더링하고 이미지 참조로 대체합니다.
+    """
+    result = mermaid_renderer.render_from_markdown(
+        request.content,
+        request.output_filename
+    )
+
+    if not result.get("success"):
+        raise HTTPException(status_code=500, detail=result.get("error"))
+
+    return {
+        "success": True,
+        "replaced_count": result["replaced_count"],
+        "diagrams": result["diagrams"],
+        "content": result["content"][:1000] + "..." if len(result.get("content", "")) > 1000 else result.get("content", "")
+    }
+
+
+@app.get("/mermaid/status", tags=["Mermaid"])
+async def mermaid_status(api_key: str = Depends(verify_api_key)):
+    """Mermaid CLI 상태 확인"""
+    return {
+        "available": mermaid_renderer.cli_available,
+        "cli": os.getenv("MERMAID_CLI", "mmdc"),
+        "output_dir": str(mermaid_renderer.output_dir)
+    }
 
 
 # ============================================================
