@@ -4,18 +4,25 @@ API Monitoring Middleware
 - 요청/응답 시간 모니터링
 - 에러 추적
 - 상태 코드 모니터링
+- 요청/응답 바디 로깅
+- UUID 기반 요청 추적
 """
 
 import time
 import os
+import uuid
+import json
 import logging
-from typing import Callable
+from typing import Callable, Optional
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 from logger_config import get_logger
 
 logger = get_logger(__name__)
+
+# 민감한 필드 목록 (마스킹 처리)
+SENSITIVE_FIELDS = {"password", "token", "api_key", "secret", "authorization", "credential"}
 
 
 class MonitoringMiddleware(BaseHTTPMiddleware):
@@ -27,17 +34,62 @@ class MonitoringMiddleware(BaseHTTPMiddleware):
     - 상태 코드 로깅
     - 에러 추적
     - 느린 요청 경고 (SLA 초과)
+    - UUID 기반 요청 추적
+    - 요청/응답 바디 로깅 (민감 정보 마스킹)
+    - User-Agent 및 호출자 정보 로깅
     """
 
     # SLA 기준 (밀리초)
     SLOW_REQUEST_THRESHOLD = int(os.getenv("SLOW_REQUEST_THRESHOLD", "1000"))  # 1초
     VERY_SLOW_THRESHOLD = int(os.getenv("VERY_SLOW_THRESHOLD", "3000"))  # 3초
+    MAX_BODY_LOG_LENGTH = int(os.getenv("MAX_BODY_LOG_LENGTH", "1000"))  # 최대 바디 로그 길이
 
     def __init__(self, app: ASGIApp):
         super().__init__(app)
         self.request_count = 0
         self.error_count = 0
         self.slow_request_count = 0
+
+    def _mask_sensitive_data(self, data: dict) -> dict:
+        """민감한 데이터 마스킹"""
+        if not isinstance(data, dict):
+            return data
+
+        masked = {}
+        for key, value in data.items():
+            if key.lower() in SENSITIVE_FIELDS:
+                masked[key] = "***MASKED***"
+            elif isinstance(value, dict):
+                masked[key] = self._mask_sensitive_data(value)
+            else:
+                masked[key] = value
+        return masked
+
+    def _truncate_body(self, body: str, max_length: int = None) -> str:
+        """바디 내용 자르기"""
+        max_length = max_length or self.MAX_BODY_LOG_LENGTH
+        if len(body) > max_length:
+            return body[:max_length] + "...[TRUNCATED]"
+        return body
+
+    async def _get_request_body(self, request: Request) -> Optional[str]:
+        """요청 바디 읽기"""
+        try:
+            body = await request.body()
+            if not body:
+                return None
+
+            # JSON 파싱 시도
+            try:
+                body_json = json.loads(body.decode("utf-8"))
+                masked = self._mask_sensitive_data(body_json)
+                return self._truncate_body(json.dumps(masked, ensure_ascii=False))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # JSON이 아니면 원본 반환
+                return self._truncate_body(body.decode("utf-8", errors="replace"))
+        except Exception as e:
+            logger.debug(f"Failed to read request body: {e}")
+            return None
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         """요청 처리 및 모니터링"""
@@ -48,22 +100,36 @@ class MonitoringMiddleware(BaseHTTPMiddleware):
         # 요청 정보 수집
         method = request.method
         path = request.url.path
+        query_params = dict(request.query_params) if request.query_params else {}
         client_host = request.client.host if request.client else "unknown"
+        user_agent = request.headers.get("user-agent", "unknown")
+        content_type = request.headers.get("content-type", "")
 
         # 건너뛸 경로 (health check 등)
         if path in ["/health", "/metrics"]:
             return await call_next(request)
 
-        # 요청 ID 생성 (추적용)
-        request_id = f"{int(start_time * 1000)}-{id(request)}"
+        # UUID 기반 요청 ID 생성
+        request_id = str(uuid.uuid4())
         request.state.request_id = request_id
 
-        # 요청 시작 로그
-        logger.info(f"Request started", extra={
-            "request_id": request_id,
-            "method": method,
-            "path": path,
-            "client": client_host
+        # 요청 바디 읽기 (POST, PUT, PATCH만)
+        request_body = None
+        if method in ["POST", "PUT", "PATCH"] and "application/json" in content_type:
+            request_body = await self._get_request_body(request)
+
+        # 요청 시작 로그 (상세 정보 포함)
+        logger.info("Request started", extra={
+            "extra_data": {
+                "request_id": request_id,
+                "method": method,
+                "path": path,
+                "query_params": query_params if query_params else None,
+                "client_ip": client_host,
+                "user_agent": user_agent,
+                "content_type": content_type,
+                "request_body": request_body
+            }
         })
 
         try:
@@ -97,20 +163,25 @@ class MonitoringMiddleware(BaseHTTPMiddleware):
                 log_level = "warning"
                 log_msg = f"Client error: {status_code}"
             else:
-                log_level = "debug"
+                log_level = "info"
                 log_msg = f"Request completed: {status_code}"
 
-            # 로그 기록
+            # 로그 기록 (상세 정보 포함)
             logger.log(
                 getattr(logging, log_level.upper()),
                 log_msg,
                 extra={
-                    "request_id": request_id,
-                    "method": method,
-                    "path": path,
-                    "status_code": status_code,
-                    "process_time_ms": round(process_time, 2),
-                    "client": client_host
+                    "extra_data": {
+                        "request_id": request_id,
+                        "method": method,
+                        "path": path,
+                        "query_params": query_params if query_params else None,
+                        "status_code": status_code,
+                        "process_time_ms": round(process_time, 2),
+                        "client_ip": client_host,
+                        "user_agent": user_agent,
+                        "response_content_type": response.headers.get("content-type", "")
+                    }
                 }
             )
 
@@ -129,12 +200,18 @@ class MonitoringMiddleware(BaseHTTPMiddleware):
             logger.error(
                 f"Unhandled exception: {str(e)}",
                 extra={
-                    "request_id": request_id,
-                    "method": method,
-                    "path": path,
-                    "process_time_ms": round(process_time, 2),
-                    "exception_type": type(e).__name__,
-                    "client": client_host
+                    "extra_data": {
+                        "request_id": request_id,
+                        "method": method,
+                        "path": path,
+                        "query_params": query_params if query_params else None,
+                        "process_time_ms": round(process_time, 2),
+                        "exception_type": type(e).__name__,
+                        "exception_message": str(e),
+                        "client_ip": client_host,
+                        "user_agent": user_agent,
+                        "request_body": request_body
+                    }
                 },
                 exc_info=True
             )
