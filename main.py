@@ -162,7 +162,25 @@ async def list_posts(
     api_key: str = Depends(verify_api_key)
 ):
     """포스트 목록"""
-    return blog_manager.list_posts(limit=limit, offset=offset, language=language)
+    import time
+    start_time = time.time()
+
+    logger.debug("list_posts endpoint called", extra={
+        "limit": limit,
+        "offset": offset,
+        "language": language
+    })
+
+    result = blog_manager.list_posts(limit=limit, offset=offset, language=language)
+
+    elapsed = time.time() - start_time
+    logger.info("list_posts completed", extra={
+        "returned_count": len(result.get("posts", [])),
+        "total_count": result.get("total", 0),
+        "duration_ms": round(elapsed * 1000, 2)
+    })
+
+    return result
 
 
 @app.get("/posts/{filename}", tags=["Posts"])
@@ -172,43 +190,78 @@ async def get_post(
     api_key: str = Depends(verify_api_key)
 ):
     """포스트 조회"""
+    import time
+    start_time = time.time()
+
+    logger.debug("get_post endpoint called", extra={
+        "filename": filename,
+        "language": language
+    })
+
     result = blog_manager.get_post(filename, language=language)
+
+    elapsed = time.time() - start_time
+
     if "error" in result:
+        logger.warning("Post not found", extra={
+            "filename": filename,
+            "language": language,
+            "duration_ms": round(elapsed * 1000, 2)
+        })
         raise HTTPException(status_code=404, detail=result["error"])
+
+    logger.info("get_post completed", extra={
+        "filename": filename,
+        "content_length": len(result.get("content", "")),
+        "duration_ms": round(elapsed * 1000, 2)
+    })
+
     return result
 
 
 @app.post("/posts", tags=["Posts"])
 async def create_post(post: PostCreate, api_key: str = Depends(verify_api_key)):
     """포스트 생성 + Git 동기화"""
-    logger.info(f"Creating post: {post.title[:50]}...", extra={
-        "title": post.title,
-        "language": post.language,
-        "tags": post.tags,
-        "draft": post.draft
-    })
-    result = blog_manager.create_post(
-        title=post.title,
-        content=post.content,
-        tags=post.tags,
-        categories=post.categories,
-        draft=post.draft,
-        auto_push=post.auto_push,
-        language=post.language
-    )
+    import time
+    start_time = time.time()
 
-    if not result.get("success"):
-        logger.error(f"Failed to create post: {result.get('error')}", extra={
-            "error": result.get("error"),
-            "title": post.title
-        })
-        raise HTTPException(status_code=500, detail=result.get("error"))
+    logger.info(f"[API] ========== CREATE POST START ==========")
+    logger.info(f"[API] Title: {post.title[:100]}")
+    logger.info(f"[API] Language: {post.language}, Draft: {post.draft}, AutoPush: {post.auto_push}")
+    logger.info(f"[API] Content length: {len(post.content)} chars")
+    logger.info(f"[API] Tags: {post.tags}, Categories: {post.categories}")
 
-    logger.info(f"Post created successfully: {result.get('filename')}", extra={
-        "filename": result.get("filename"),
-        "language": result.get("language")
-    })
-    return result
+    try:
+        logger.info("[API] Calling blog_manager.create_post...")
+        result = blog_manager.create_post(
+            title=post.title,
+            content=post.content,
+            tags=post.tags,
+            categories=post.categories,
+            draft=post.draft,
+            auto_push=post.auto_push,
+            language=post.language
+        )
+
+        elapsed = time.time() - start_time
+        elapsed_ms = round(elapsed * 1000, 2)
+
+        if not result.get("success"):
+            logger.error(f"[API] CREATE POST FAILED ({elapsed_ms}ms): {result.get('error')}")
+            raise HTTPException(status_code=500, detail=result.get("error"))
+
+        logger.info(f"[API] ========== CREATE POST SUCCESS ({elapsed_ms}ms) ==========")
+        logger.info(f"[API] Filename: {result.get('filename')}")
+        logger.info(f"[API] Git result: {result.get('git')}")
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        elapsed = time.time() - start_time
+        logger.error(f"[API] CREATE POST EXCEPTION ({round(elapsed * 1000, 2)}ms): {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.put("/posts/{filename}", tags=["Posts"])
@@ -219,6 +272,16 @@ async def update_post(
     api_key: str = Depends(verify_api_key)
 ):
     """포스트 수정"""
+    import time
+    start_time = time.time()
+
+    logger.info("update_post endpoint called", extra={
+        "filename": filename,
+        "language": language,
+        "auto_push": post.auto_push,
+        "content_length": len(post.content)
+    })
+
     result = blog_manager.update_post(
         filename=filename,
         content=post.content,
@@ -226,8 +289,21 @@ async def update_post(
         language=language
     )
 
+    elapsed = time.time() - start_time
+
     if not result.get("success"):
+        logger.warning("update_post failed", extra={
+            "error": result.get("error"),
+            "filename": filename,
+            "duration_ms": round(elapsed * 1000, 2)
+        })
         raise HTTPException(status_code=404, detail=result.get("error"))
+
+    logger.info("update_post completed successfully", extra={
+        "filename": filename,
+        "language": result.get("language"),
+        "duration_ms": round(elapsed * 1000, 2)
+    })
 
     return result
 
@@ -239,10 +315,31 @@ async def delete_post(
     api_key: str = Depends(verify_api_key)
 ):
     """포스트 삭제"""
+    import time
+    start_time = time.time()
+
+    logger.info("delete_post endpoint called", extra={
+        "filename": filename,
+        "language": language
+    })
+
     result = blog_manager.delete_post(filename, language=language)
 
+    elapsed = time.time() - start_time
+
     if not result.get("success"):
+        logger.warning("delete_post failed", extra={
+            "error": result.get("error"),
+            "filename": filename,
+            "duration_ms": round(elapsed * 1000, 2)
+        })
         raise HTTPException(status_code=404, detail=result.get("error"))
+
+    logger.info("delete_post completed successfully", extra={
+        "filename": filename,
+        "language": result.get("language"),
+        "duration_ms": round(elapsed * 1000, 2)
+    })
 
     return result
 
@@ -257,7 +354,22 @@ async def search(
     api_key: str = Depends(verify_api_key)
 ):
     """포스트 검색"""
-    return blog_manager.search_posts(q)
+    import time
+    start_time = time.time()
+
+    logger.info("search endpoint called", extra={"query": q, "query_length": len(q)})
+
+    result = blog_manager.search_posts(q)
+
+    elapsed = time.time() - start_time
+    logger.info("search completed", extra={
+        "query": q,
+        "result_count": result.get("total", 0),
+        "returned_count": len(result.get("results", [])),
+        "duration_ms": round(elapsed * 1000, 2)
+    })
+
+    return result
 
 
 # ============================================================
@@ -267,13 +379,35 @@ async def search(
 @app.post("/sync", tags=["Git"])
 async def sync(api_key: str = Depends(verify_api_key)):
     """Git 원격 동기화"""
-    return blog_manager.sync()
+    import time
+    start_time = time.time()
+
+    logger.info("sync endpoint called")
+
+    result = blog_manager.sync()
+
+    elapsed = time.time() - start_time
+    logger.info("sync completed", extra={
+        "success": result.get("success"),
+        "duration_ms": round(elapsed * 1000, 2)
+    })
+
+    return result
 
 
 @app.get("/status", tags=["Git"])
 async def status(api_key: str = Depends(verify_api_key)):
     """Git 상태"""
-    return git_handler.get_status()
+    logger.debug("status endpoint called")
+
+    result = git_handler.get_status()
+
+    logger.debug("status completed", extra={
+        "clean": result.get("clean"),
+        "change_count": result.get("change_count", 0)
+    })
+
+    return result
 
 
 # ============================================================
@@ -283,7 +417,19 @@ async def status(api_key: str = Depends(verify_api_key)):
 @app.post("/translate", tags=["Translation"])
 async def translate(request: TranslateRequest, api_key: str = Depends(verify_api_key)):
     """LLM 기반 마크다운 번역"""
+    import time
+    start_time = time.time()
+
+    logger.info("translate endpoint called", extra={
+        "source": request.source,
+        "target": request.target,
+        "content_length": len(request.content)
+    })
+
     if request.source == request.target:
+        logger.warning("Same source and target language requested", extra={
+            "language": request.source
+        })
         raise HTTPException(
             status_code=400,
             detail="Source and target languages must be different"
@@ -295,8 +441,21 @@ async def translate(request: TranslateRequest, api_key: str = Depends(verify_api
         target=request.target
     )
 
+    elapsed = time.time() - start_time
+
     if not result.get("success"):
+        logger.error("translate failed", extra={
+            "error": result.get("error"),
+            "duration_ms": round(elapsed * 1000, 2)
+        })
         raise HTTPException(status_code=500, detail=result.get("error"))
+
+    logger.info("translate completed successfully", extra={
+        "source": request.source,
+        "target": request.target,
+        "result_length": len(result.get("translated", "")),
+        "duration_ms": round(elapsed * 1000, 2)
+    })
 
     return result
 
@@ -308,20 +467,44 @@ async def translate_sync(api_key: str = Depends(verify_api_key)):
     - 번역되지 않은 포스트 찾기
     - 자동 번역 후 저장
     """
+    import time
+    start_time = time.time()
+
+    logger.info("translate_sync endpoint called")
+
     if not translator.api_key:
+        logger.error("Translation service not configured")
         raise HTTPException(
             status_code=503,
             detail="Translation service not configured. Set API key."
         )
 
     result = blog_manager.sync_translations()
+
+    elapsed = time.time() - start_time
+    logger.info("translate_sync completed", extra={
+        "translated": result.get("summary", {}).get("translated", 0),
+        "failed": result.get("summary", {}).get("failed", 0),
+        "duration_ms": round(elapsed * 1000, 2)
+    })
+
     return result
 
 
 @app.get("/translate/status", tags=["Translation"])
 async def translation_status(api_key: str = Depends(verify_api_key)):
     """번역 상태 확인"""
-    return blog_manager.get_translation_status()
+    logger.debug("translation_status endpoint called")
+
+    result = blog_manager.get_translation_status()
+
+    logger.debug("translation_status completed", extra={
+        "korean_posts": result.get("korean_posts", 0),
+        "english_posts": result.get("english_posts", 0),
+        "needs_translation": result.get("needs_translation_count", 0)
+    })
+
+    return result
 
 
 # ============================================================

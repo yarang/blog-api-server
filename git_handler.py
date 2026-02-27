@@ -5,15 +5,15 @@ Git 작업 핸들러
 
 import os
 import subprocess
-import threading
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 from datetime import datetime
-import logging
 
-# 로깅 설정
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from logger_config import get_logger
+from file_lock import git_lock
+
+logger = get_logger(__name__)
 
 # 블로그 루트 경로
 BLOG_ROOT = Path(os.getenv("BLOG_REPO_PATH", os.getenv("BLOG_ROOT", Path(__file__).parent.parent)))
@@ -24,51 +24,123 @@ class GitHandler:
 
     def __init__(self, repo_path: Path = BLOG_ROOT):
         self.repo_path = repo_path
-        self._lock = threading.Lock()
+        logger.debug("GitHandler initialized", extra={"repo_path": str(repo_path)})
 
     def _run_git(self, *args) -> tuple:
         """Git 명령어 실행"""
+        import time
+        cmd = ["git"] + list(args)
+        start_time = time.time()
+        cmd_str = " ".join(cmd)
+
+        logger.info(f"[GIT] Starting command: {cmd_str}", extra={
+            "command": cmd_str,
+            "args_count": len(args),
+            "repo_path": str(self.repo_path)
+        })
+
         try:
             result = subprocess.run(
-                ["git"] + list(args),
+                cmd,
                 cwd=self.repo_path,
                 capture_output=True,
                 text=True,
                 timeout=60
             )
+
+            elapsed = time.time() - start_time
+            elapsed_ms = round(elapsed * 1000, 2)
+
+            if result.returncode != 0:
+                logger.warning(f"[GIT] Command FAILED: {cmd_str} ({elapsed_ms}ms)", extra={
+                    "command": cmd_str,
+                    "returncode": result.returncode,
+                    "stderr": result.stderr[:500],
+                    "stdout": result.stdout[:200],
+                    "duration_ms": elapsed_ms
+                })
+            else:
+                logger.info(f"[GIT] Command OK: {cmd_str} ({elapsed_ms}ms)", extra={
+                    "command": cmd_str,
+                    "duration_ms": elapsed_ms,
+                    "stdout_lines": len(result.stdout.split('\n')) if result.stdout else 0
+                })
+
             return result.returncode, result.stdout, result.stderr
-        except subprocess.TimeoutExpired:
+
+        except subprocess.TimeoutExpired as e:
+            elapsed = time.time() - start_time
+            logger.error(f"[GIT] TIMEOUT: {cmd_str} (>60s)", extra={
+                "command": cmd_str,
+                "timeout_sec": 60,
+                "duration_ms": round(elapsed * 1000, 2),
+                "error_type": "TimeoutExpired"
+            })
             return -1, "", "Git command timed out"
         except Exception as e:
+            elapsed = time.time() - start_time
+            logger.error(f"[GIT] ERROR: {cmd_str} - {str(e)}", extra={
+                "command": cmd_str,
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "duration_ms": round(elapsed * 1000, 2)
+            })
             return -1, "", str(e)
 
     def get_status(self) -> Dict[str, Any]:
         """Git 상태 확인"""
+        logger.debug("Getting git status")
+
         code, stdout, stderr = self._run_git("status", "--porcelain")
 
         if code != 0:
+            logger.error("Failed to get git status", extra={"stderr": stderr})
             return {"error": stderr, "clean": False}
 
         changes = stdout.strip().split("\n") if stdout.strip() else []
-        return {
+        result = {
             "clean": len(changes) == 0,
             "changes": changes,
             "change_count": len(changes)
         }
 
+        logger.debug("Git status retrieved", extra={
+            "clean": result["clean"],
+            "change_count": result["change_count"]
+        })
+
+        return result
+
     def sync_from_remote(self) -> Dict[str, Any]:
         """원격 저장소에서 동기화 (pull)"""
-        with self._lock:
+        start_time = time.time()
+        logger.info("[SYNC] Starting sync from remote")
+
+        logger.info("[SYNC] Acquiring git lock...")
+        with git_lock():
+            logger.info("[SYNC] Git lock acquired")
+
             # 먼저 fetch
+            logger.info("[SYNC] Step 1: Fetching from origin...")
             code, stdout, stderr = self._run_git("fetch", "origin")
             if code != 0:
+                logger.error("[SYNC] Fetch failed", extra={"stderr": stderr})
                 return {"success": False, "error": f"Fetch failed: {stderr}"}
 
+            logger.info("[SYNC] Fetch completed")
+
             # pull
+            logger.info("[SYNC] Step 2: Pulling from origin/main...")
             code, stdout, stderr = self._run_git("pull", "origin", "main")
             if code != 0:
+                logger.error("[SYNC] Pull failed", extra={"stderr": stderr, "stdout": stdout})
                 # 충돌이나 다른 문제
                 return {"success": False, "error": stderr, "output": stdout}
+
+            elapsed = time.time() - start_time
+            logger.info(f"[SYNC] Sync completed successfully ({round(elapsed * 1000, 2)}ms)", extra={
+                "duration_ms": round(elapsed * 1000, 2)
+            })
 
             return {
                 "success": True,
@@ -95,30 +167,58 @@ class GitHandler:
         Returns:
             결과 딕셔너리
         """
-        with self._lock:
-            # 변경사항 확인
+        start_time = time.time()
+
+        logger.info(f"[COMMIT] Starting commit and push: {message[:50]}...", extra={
+            "message": message[:100],
+            "files": files,
+            "author": author_name
+        })
+
+        logger.info("[COMMIT] Acquiring git lock...")
+        with git_lock():
+            logger.info("[COMMIT] Git lock acquired")
+
+            # Step 1: 변경사항 확인
+            logger.info("[COMMIT] Step 1: Checking git status...")
             status = self.get_status()
             if status["clean"]:
+                elapsed = round((time.time() - start_time) * 1000, 2)
+                logger.info(f"[COMMIT] No changes to commit ({elapsed}ms)")
                 return {"success": True, "message": "No changes to commit"}
 
-            # 파일 추가
+            logger.info(f"[COMMIT] Changes detected: {status['change_count']} files", extra={
+                "change_count": status["change_count"],
+                "changes": status["changes"][:5]
+            })
+
+            # Step 2: 파일 추가
+            logger.info("[COMMIT] Step 2: Staging files...")
             if files:
                 for file in files:
+                    logger.info(f"[COMMIT] Staging file: {file}")
                     code, _, stderr = self._run_git("add", file)
                     if code != 0:
+                        logger.error(f"[COMMIT] Failed to add file: {file}", extra={"stderr": stderr})
                         return {"success": False, "error": f"Failed to add {file}: {stderr}"}
+                logger.info(f"[COMMIT] Files staged: {files}")
             else:
-                # content와 static만 추가 (설정 파일 제외)
+                logger.info("[COMMIT] Staging content/ and static/")
                 code, _, stderr = self._run_git("add", "content/", "static/")
                 if code != 0:
+                    logger.error("[COMMIT] Failed to add directories", extra={"stderr": stderr})
                     return {"success": False, "error": f"Failed to add files: {stderr}"}
+                logger.info("[COMMIT] Directories staged")
 
-            # 변경사항이 있는지 다시 확인
+            # Step 3: 변경사항 확인
+            logger.info("[COMMIT] Step 3: Verifying staged changes...")
             code, stdout, stderr = self._run_git("diff", "--cached", "--quiet")
             if code == 0:  # 변경사항 없음
+                logger.info("[COMMIT] No changes after staging")
                 return {"success": True, "message": "No changes to commit after staging"}
 
-            # 커밋
+            # Step 4: 커밋
+            logger.info("[COMMIT] Step 4: Creating commit...")
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             full_message = f"{message}\n\nCommitted by Blog API at {timestamp}"
 
@@ -129,18 +229,35 @@ class GitHandler:
             )
 
             if code != 0:
+                logger.error("[COMMIT] Commit failed", extra={"stderr": stderr})
                 return {"success": False, "error": f"Commit failed: {stderr}"}
 
-            # Push
+            logger.info(f"[COMMIT] Commit created: {message[:50]}")
+
+            # Step 5: Push
+            logger.info("[COMMIT] Step 5: Pushing to origin/main...")
+            push_start = time.time()
             code, stdout, stderr = self._run_git("push", "origin", "main")
+            push_elapsed = time.time() - push_start
 
             if code != 0:
+                logger.error("[COMMIT] Push failed", extra={
+                    "stderr": stderr,
+                    "push_duration_ms": round(push_elapsed * 1000, 2)
+                })
                 return {
                     "success": False,
                     "error": f"Push failed: {stderr}",
                     "committed": True,
                     "commit_message": full_message
                 }
+
+            total_elapsed = time.time() - start_time
+            logger.info(f"[COMMIT] SUCCESS: Commit and push completed ({round(total_elapsed * 1000, 2)}ms)", extra={
+                "message": message[:100],
+                "push_duration_ms": round(push_elapsed * 1000, 2),
+                "total_duration_ms": round(total_elapsed * 1000, 2)
+            })
 
             return {
                 "success": True,
@@ -151,11 +268,14 @@ class GitHandler:
 
     def get_recent_commits(self, limit: int = 5) -> Dict[str, Any]:
         """최근 커밋 목록 조회"""
+        logger.debug("Getting recent commits", extra={"limit": limit})
+
         code, stdout, stderr = self._run_git(
             "log", f"-{limit}", "--oneline", "--format=%h %s %ci"
         )
 
         if code != 0:
+            logger.error("Failed to get recent commits", extra={"stderr": stderr})
             return {"error": stderr}
 
         commits = []
@@ -169,6 +289,7 @@ class GitHandler:
                         "date": parts[2] if len(parts) > 2 else ""
                     })
 
+        logger.debug("Recent commits retrieved", extra={"count": len(commits)})
         return {"commits": commits}
 
 
