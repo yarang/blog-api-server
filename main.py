@@ -205,11 +205,11 @@ async def get_post(
     result = blog_manager.get_post(filename, language=language)
 
     if "error" in result:
-        logger.warning("Post not found", extra={"filename": filename, "language": language})
+        logger.warning("Post not found", extra={"post_filename": filename, "language": language})
         raise HTTPException(status_code=404, detail=result["error"])
 
     logger.debug("get_post result", extra={
-        "filename": filename,
+        "post_filename": filename,
         "content_length": len(result.get("content", ""))
     })
 
@@ -245,7 +245,7 @@ async def create_post(post: PostCreate, api_key: str = Depends(verify_api_key)):
         raise HTTPException(status_code=500, detail=result.get("error"))
 
     logger.info("[API] Post created successfully", extra={
-        "filename": result.get("filename"),
+        "post_filename": result.get("filename"),
         "git_success": result.get("git", {}).get("success", False)
     })
 
@@ -262,7 +262,7 @@ async def update_post(
 ):
     """포스트 수정"""
     logger.debug("update_post request", extra={
-        "filename": filename,
+        "post_filename": filename,
         "language": language,
         "auto_push": post.auto_push,
         "content_length": len(post.content)
@@ -278,7 +278,7 @@ async def update_post(
     if not result.get("success"):
         logger.warning("update_post failed", extra={
             "error": result.get("error"),
-            "filename": filename
+            "post_filename": filename
         })
         raise HTTPException(status_code=404, detail=result.get("error"))
 
@@ -298,7 +298,7 @@ async def delete_post(
     if not result.get("success"):
         logger.warning("delete_post failed", extra={
             "error": result.get("error"),
-            "filename": filename
+            "post_filename": filename
         })
         raise HTTPException(status_code=404, detail=result.get("error"))
 
