@@ -238,16 +238,21 @@ class GitHandler:
         message: str,
         files: list = None,
         author_name: str = "Blog API",
-        author_email: str = "blog-api@fcoinfup.com"
+        author_email: str = "blog-api@fcoinfup.com",
+        _locked: bool = False  # 내부용: 호출자가 이미 락을 획득했는지
     ) -> Dict[str, Any]:
         """
         변경사항을 commit하고 push
+
+        주의: 이 메서드를 직접 호출할 때는 호출자가 git_lock()을 획득해야 합니다.
+        또는 _locked=True를 전달하여 내부에서 락을 획득하도록 할 수 있습니다.
 
         Args:
             message: 커밋 메시지
             files: 특정 파일 목록 (None이면 모든 변경사항)
             author_name: 커밋 작성자 이름
             author_email: 커밋 작성자 이메일
+            _locked: 내부용 (True면 락 획득 건너뜀)
 
         Returns:
             결과 딕셔너리
@@ -255,101 +260,97 @@ class GitHandler:
         start_time = time.time()
 
         logger.info(f"[COMMIT] Starting commit and push: {message[:50]}...", extra={
-            "message": message[:100],
+            "commit_message": message[:100],
             "files": files,
             "author": author_name
         })
 
-        logger.info("[COMMIT] Acquiring git lock...")
-        with git_lock():
-            logger.info("[COMMIT] Git lock acquired")
+        # Step 1: 변경사항 확인
+        logger.info("[COMMIT] Step 1: Checking git status...")
+        status = self.get_status()
+        if status["clean"]:
+            elapsed = round((time.time() - start_time) * 1000, 2)
+            logger.info(f"[COMMIT] No changes to commit ({elapsed}ms)")
+            return {"success": True, "message": "No changes to commit"}
 
-            # Step 1: 변경사항 확인
-            logger.info("[COMMIT] Step 1: Checking git status...")
-            status = self.get_status()
-            if status["clean"]:
-                elapsed = round((time.time() - start_time) * 1000, 2)
-                logger.info(f"[COMMIT] No changes to commit ({elapsed}ms)")
-                return {"success": True, "message": "No changes to commit"}
+        logger.info(f"[COMMIT] Changes detected: {status['change_count']} files", extra={
+            "change_count": status["change_count"],
+            "changes": status["changes"][:5]
+        })
 
-            logger.info(f"[COMMIT] Changes detected: {status['change_count']} files", extra={
-                "change_count": status["change_count"],
-                "changes": status["changes"][:5]
-            })
-
-            # Step 2: 파일 추가
-            logger.info("[COMMIT] Step 2: Staging files...")
-            if files:
-                for file in files:
-                    logger.info(f"[COMMIT] Staging file: {file}")
-                    code, _, stderr = self._run_git("add", file)
-                    if code != 0:
-                        logger.error(f"[COMMIT] Failed to add file: {file}", extra={"stderr": stderr})
-                        return {"success": False, "error": f"Failed to add {file}: {stderr}"}
-                logger.info(f"[COMMIT] Files staged: {files}")
-            else:
-                logger.info("[COMMIT] Staging content/ and static/")
-                code, _, stderr = self._run_git("add", "content/", "static/")
+        # Step 2: 파일 추가
+        logger.info("[COMMIT] Step 2: Staging files...")
+        if files:
+            for file in files:
+                logger.info(f"[COMMIT] Staging file: {file}")
+                code, _, stderr = self._run_git("add", file)
                 if code != 0:
-                    logger.error("[COMMIT] Failed to add directories", extra={"stderr": stderr})
-                    return {"success": False, "error": f"Failed to add files: {stderr}"}
-                logger.info("[COMMIT] Directories staged")
-
-            # Step 3: 변경사항 확인
-            logger.info("[COMMIT] Step 3: Verifying staged changes...")
-            code, stdout, stderr = self._run_git("diff", "--cached", "--quiet")
-            if code == 0:  # 변경사항 없음
-                logger.info("[COMMIT] No changes after staging")
-                return {"success": True, "message": "No changes to commit after staging"}
-
-            # Step 4: 커밋
-            logger.info("[COMMIT] Step 4: Creating commit...")
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            full_message = f"{message}\n\nCommitted by Blog API at {timestamp}"
-
-            code, stdout, stderr = self._run_git(
-                "-c", f"user.name={author_name}",
-                "-c", f"user.email={author_email}",
-                "commit", "-m", full_message
-            )
-
+                    logger.error(f"[COMMIT] Failed to add file: {file}", extra={"stderr": stderr})
+                    return {"success": False, "error": f"Failed to add {file}: {stderr}"}
+            logger.info(f"[COMMIT] Files staged: {files}")
+        else:
+            logger.info("[COMMIT] Staging content/ and static/")
+            code, _, stderr = self._run_git("add", "content/", "static/")
             if code != 0:
-                logger.error("[COMMIT] Commit failed", extra={"stderr": stderr})
-                return {"success": False, "error": f"Commit failed: {stderr}"}
+                logger.error("[COMMIT] Failed to add directories", extra={"stderr": stderr})
+                return {"success": False, "error": f"Failed to add files: {stderr}"}
+            logger.info("[COMMIT] Directories staged")
 
-            logger.info(f"[COMMIT] Commit created: {message[:50]}")
+        # Step 3: 변경사항 확인
+        logger.info("[COMMIT] Step 3: Verifying staged changes...")
+        code, stdout, stderr = self._run_git("diff", "--cached", "--quiet")
+        if code == 0:  # 변경사항 없음
+            logger.info("[COMMIT] No changes after staging")
+            return {"success": True, "message": "No changes to commit after staging"}
 
-            # Step 5: Push
-            logger.info("[COMMIT] Step 5: Pushing to origin/main...")
-            push_start = time.time()
-            code, stdout, stderr = self._run_git("push", "origin", "main")
-            push_elapsed = time.time() - push_start
+        # Step 4: 커밋
+        logger.info("[COMMIT] Step 4: Creating commit...")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        full_message = f"{message}\n\nCommitted by Blog API at {timestamp}"
 
-            if code != 0:
-                logger.error("[COMMIT] Push failed", extra={
-                    "stderr": stderr,
-                    "push_duration_ms": round(push_elapsed * 1000, 2)
-                })
-                return {
-                    "success": False,
-                    "error": f"Push failed: {stderr}",
-                    "committed": True,
-                    "commit_message": full_message
-                }
+        code, stdout, stderr = self._run_git(
+            "-c", f"user.name={author_name}",
+            "-c", f"user.email={author_email}",
+            "commit", "-m", full_message
+        )
 
-            total_elapsed = time.time() - start_time
-            logger.info(f"[COMMIT] SUCCESS: Commit and push completed ({round(total_elapsed * 1000, 2)}ms)", extra={
-                "message": message[:100],
-                "push_duration_ms": round(push_elapsed * 1000, 2),
-                "total_duration_ms": round(total_elapsed * 1000, 2)
+        if code != 0:
+            logger.error("[COMMIT] Commit failed", extra={"stderr": stderr})
+            return {"success": False, "error": f"Commit failed: {stderr}"}
+
+        logger.info(f"[COMMIT] Commit created: {message[:50]}")
+
+        # Step 5: Push
+        logger.info("[COMMIT] Step 5: Pushing to origin/main...")
+        push_start = time.time()
+        code, stdout, stderr = self._run_git("push", "origin", "main")
+        push_elapsed = time.time() - push_start
+
+        if code != 0:
+            logger.error("[COMMIT] Push failed", extra={
+                "stderr": stderr,
+                "push_duration_ms": round(push_elapsed * 1000, 2)
             })
-
             return {
-                "success": True,
-                "message": "Successfully committed and pushed",
-                "commit_message": full_message,
-                "changes": status["changes"]
+                "success": False,
+                "error": f"Push failed: {stderr}",
+                "committed": True,
+                "commit_message": full_message
             }
+
+        total_elapsed = time.time() - start_time
+        logger.info(f"[COMMIT] SUCCESS: Commit and push completed ({round(total_elapsed * 1000, 2)}ms)", extra={
+            "commit_message": message[:100],
+            "push_duration_ms": round(push_elapsed * 1000, 2),
+            "total_duration_ms": round(total_elapsed * 1000, 2)
+        })
+
+        return {
+            "success": True,
+            "message": "Successfully committed and pushed",
+            "commit_message": full_message,
+            "changes": status["changes"]
+        }
 
     def get_recent_commits(self, limit: int = 5) -> Dict[str, Any]:
         """최근 커밋 목록 조회"""
