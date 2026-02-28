@@ -206,11 +206,8 @@ TocOpen = true
                     "content_length": content_length
                 })
 
-                # 한국어는 content/post/, 영어는 content/en/post/
-                if language == "ko":
-                    relative_path = f"content/post/{filename}"
-                else:
-                    relative_path = f"content/{language}/post/{filename}"
+                # 모든 언어는 content/{language}/post/ 사용
+                relative_path = f"content/{language}/post/{filename}"
 
                 result = {
                     "success": True,
