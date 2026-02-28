@@ -1,17 +1,51 @@
 """
 LLM 기반 번역 모듈
 Anthropic Claude API 또는 ZAI API를 사용하여 마크다운 포스트를 번역합니다.
+Mermaid 다이어그램 렌더링 기능을 포함합니다.
 """
 
 import os
 import re
 import json
 import httpx
-from typing import Dict, Optional, Any
+import asyncio
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Dict, Optional, Any, List, TypedDict
 
 from logger_config import get_logger
 
 logger = get_logger(__name__)
+
+
+# 타입 정의
+class TranslationResult(TypedDict, total=False):
+    """번역 결과 타입"""
+    success: bool
+    translated: Optional[str]
+    source_language: Optional[str]
+    target_language: Optional[str]
+    error: Optional[str]
+
+
+class MermaidRenderResult(TypedDict, total=False):
+    """Mermaid 렌더링 결과 타입"""
+    success: bool
+    path: Optional[str]
+    filename: Optional[str]
+    svg: Optional[str]
+    error: Optional[str]
+
+
+class MermaidMarkdownResult(TypedDict, total=False):
+    """Mermaid 마크다운 처리 결과 타입"""
+    success: bool
+    replaced_count: int
+    diagrams: List[Dict[str, str]]
+    content: Optional[str]
+    error: Optional[str]
+
 
 # 환경 변수
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -19,6 +53,9 @@ ZAI_API_KEY = os.getenv("ZAI_API_KEY")
 # ZAI API는 OpenAI 호환 엔드포인트 사용
 ZAI_BASE_URL = os.getenv("ZAI_BASE_URL", "https://api.zukijourney.com/v1")
 ZAI_MODEL = os.getenv("ZAI_MODEL", "gpt-4o-mini")
+
+# Mermaid CLI 경로 (npm install -g @mermaid-js/mermaid-cli)
+MERMAID_CLI = os.getenv("MERMAID_CLI", "mmdc")
 
 # 지원하는 언어 쌍
 SUPPORTED_LANGUAGE_PAIRS = [
@@ -177,7 +214,7 @@ class Translator:
         source: str = "ko",
         target: str = "en",
         preserve_markdown: bool = True
-    ) -> Dict[str, any]:
+    ) -> TranslationResult:
         """
         마크다운 콘텐츠 번역
 
@@ -284,7 +321,7 @@ Title: {parsed["title"]}"""
                 "error": str(e)
             }
 
-    def translate_title_only(self, title: str, target: str = "en") -> Dict[str, any]:
+    def translate_title_only(self, title: str, target: str = "en") -> TranslationResult:
         """제목만 번역"""
         if not self.api_key:
             return {
@@ -315,5 +352,185 @@ Title: {title}"""
             return {"success": False, "error": str(e)}
 
 
+class MermaidRenderer:
+    """
+    Mermaid 다이어그램 렌더러
+
+    Marked/CodeBlock의 Mermaid 코드를 SVG로 변환합니다.
+    """
+
+    def __init__(self, output_dir: Optional[str] = None):
+        """
+        Args:
+            output_dir: SVG 파일 저장 디렉토리 (None이면 임시 디렉토리 사용)
+        """
+        self.output_dir = Path(output_dir) if output_dir else Path(tempfile.gettempdir()) / "mermaid"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.cli_available = self._check_cli()
+
+    def _check_cli(self) -> bool:
+        """Mermaid CLI 설치 확인"""
+        try:
+            result = subprocess.run(
+                [MERMAID_CLI, "--version"],
+                capture_output=True,
+                timeout=5
+            )
+            available = result.returncode == 0
+            if available:
+                logger.info("Mermaid CLI available", extra={"cli": MERMAID_CLI})
+            else:
+                logger.warning("Mermaid CLI not found", extra={"cli": MERMAID_CLI})
+            return available
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            logger.warning("Mermaid CLI not found", extra={"cli": MERMAID_CLI})
+            return False
+
+    def render(self, mermaid_code: str, filename: Optional[str] = None) -> MermaidRenderResult:
+        """
+        Mermaid 코드를 SVG로 렌더링
+
+        Args:
+            mermaid_code: Mermaid 다이어그램 코드
+            filename: 저장할 파일명 (None이면 자동 생성)
+
+        Returns:
+            {"success": bool, "path": str, "svg": str} 또는 {"success": False, "error": str}
+        """
+        if not self.cli_available:
+            return {
+                "success": False,
+                "error": "Mermaid CLI not installed. Run: npm install -g @mermaid-js/mermaid-cli"
+            }
+
+        if not filename:
+            import hashlib
+            hash_obj = hashlib.md5(mermaid_code.encode())
+            filename = f"diagram_{hash_obj.hexdigest()[:12]}.svg"
+
+        output_path = self.output_dir / filename
+
+        try:
+            # 임시 입력 파일 생성
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.mmd', delete=False) as f:
+                f.write(mermaid_code)
+                input_path = f.name
+
+            # Mermaid CLI 실행
+            result = subprocess.run(
+                [
+                    MERMAID_CLI,
+                    "-i", input_path,
+                    "-o", str(output_path),
+                    "-s", "maxWidth:2048",  # 최대 너비 설정
+                    "-b", "transparent"     # 투명 배경
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            # 임시 파일 삭제
+            os.unlink(input_path)
+
+            if result.returncode != 0:
+                logger.error(f"Mermaid render failed: {result.stderr}", extra={
+                    "stderr": result.stderr[:500]
+                })
+                return {
+                    "success": False,
+                    "error": f"Mermaid render failed: {result.stderr[:200]}"
+                }
+
+            # SVG 읽기
+            svg_content = output_path.read_text(encoding="utf-8")
+
+            logger.info(f"Mermaid diagram rendered", extra={
+                "filename": filename,
+                "svg_size": len(svg_content)
+            })
+
+            return {
+                "success": True,
+                "path": str(output_path),
+                "filename": filename,
+                "svg": svg_content
+            }
+
+        except subprocess.TimeoutExpired:
+            logger.error("Mermaid render timeout")
+            return {"success": False, "error": "Mermaid render timeout"}
+
+        except Exception as e:
+            logger.error(f"Mermaid render error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def render_from_markdown(self, markdown_content: str, output_path: Optional[str] = None) -> MermaidMarkdownResult:
+        """
+        마크다운에서 Mermaid 코드블록을 추출하여 SVG로 변환
+
+        Args:
+            markdown_content: 마크다운 콘텐츠
+            output_path: 결과를 저장할 마크다운 파일 경로
+
+        Returns:
+            {"success": bool, "replaced_count": int, "diagrams": List[Dict]}
+        """
+        if not self.cli_available:
+            return {
+                "success": False,
+                "error": "Mermaid CLI not installed. Run: npm install -g @mermaid-js/mermaid-cli"
+            }
+
+        # Mermaid 코드블록 찾기 (```mermaid ... ```)
+        mermaid_pattern = re.compile(
+            r'```mermaid\n(.*?)\n```',
+            re.DOTALL
+        )
+
+        diagrams = []
+        replaced_count = 0
+        result_content = markdown_content
+
+        for match in mermaid_pattern.finditer(markdown_content):
+            mermaid_code = match.group(1)
+            render_result = self.render(mermaid_code)
+
+            if render_result.get("success"):
+                # 상대 경로 계산 (output_path 기준)
+                if output_path:
+                    output_file = Path(output_path).parent
+                    svg_path = Path(render_result["path"])
+                    try:
+                        rel_path = svg_path.relative_to(output_file)
+                    except ValueError:
+                        rel_path = svg_path.name
+                else:
+                    rel_path = svg_path.name
+
+                # 마크다운의 코드블록을 이미지 참조로 대체
+                img_ref = f'![diagram]({rel_path})'
+                result_content = result_content[:match.start()] + img_ref + result_content[match.end():]
+
+                diagrams.append({
+                    "original_code": mermaid_code,
+                    "svg_path": render_result["path"],
+                    "relative_path": str(rel_path)
+                })
+                replaced_count += 1
+
+                logger.debug(f"Mermaid diagram replaced", extra={
+                    "relative_path": str(rel_path)
+                })
+
+        return {
+            "success": True,
+            "replaced_count": replaced_count,
+            "diagrams": diagrams,
+            "content": result_content
+        }
+
+
 # 전역 인스턴스
 translator = Translator()
+mermaid_renderer = MermaidRenderer()

@@ -8,10 +8,10 @@ import secrets
 from typing import Optional
 from fastapi import HTTPException, Security, status
 from fastapi.security import APIKeyHeader
-from dotenv import load_dotenv
 
-# 환경 변수 로드
-load_dotenv()
+from logger_config import get_logger
+
+logger = get_logger(__name__)
 
 # API Key 헤더 정의
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -25,6 +25,7 @@ def get_valid_api_keys() -> set:
 
     # 쉼표로 구분된 여러 키 지원
     keys = [k.strip() for k in keys_str.split(",") if k.strip()]
+    logger.debug(f"Loaded {len(keys)} API keys")
     return set(keys)
 
 
@@ -46,6 +47,7 @@ async def verify_api_key(api_key: Optional[str] = Security(api_key_header)) -> s
 
     # API 키가 설정되지 않은 경우
     if not valid_keys:
+        logger.error("No API keys configured")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="API authentication not configured"
@@ -53,6 +55,7 @@ async def verify_api_key(api_key: Optional[str] = Security(api_key_header)) -> s
 
     # API 키가 제공되지 않은 경우
     if not api_key:
+        logger.warning("API request without key")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="API Key required. Provide X-API-Key header."
@@ -60,11 +63,15 @@ async def verify_api_key(api_key: Optional[str] = Security(api_key_header)) -> s
 
     # API 키 검증
     if api_key not in valid_keys:
+        logger.warning("Invalid API key provided", extra={
+            "key_prefix": api_key[:10] if api_key else "None"
+        })
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API Key"
         )
 
+    logger.debug("API key verified successfully")
     return api_key
 
 

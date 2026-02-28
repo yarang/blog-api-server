@@ -57,7 +57,7 @@ uv pip install mcp httpx
       "command": "/Users/사용자/.blog-mcp-client/.venv/bin/python",
       "args": ["/Users/사용자/.blog-mcp-client/mcp_blog_client.py"],
       "env": {
-        "BLOG_API_URL": "http://130.162.133.47",
+        "BLOG_API_URL": "https://blog.fcoinfup.com",
         "BLOG_API_KEY": "your_api_key_here"
       }
     }

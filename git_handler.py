@@ -7,7 +7,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from datetime import datetime
 
 from logger_config import get_logger
@@ -26,7 +26,7 @@ class GitHandler:
         self.repo_path = repo_path
         logger.debug("GitHandler initialized", extra={"repo_path": str(repo_path)})
 
-    def _run_git(self, *args) -> tuple:
+    def _run_git(self, *args) -> Tuple[int, str, str]:
         """Git 명령어 실행"""
         import time
         cmd = ["git"] + list(args)
@@ -86,6 +86,91 @@ class GitHandler:
                 "duration_ms": round(elapsed * 1000, 2)
             })
             return -1, "", str(e)
+
+    def ensure_repo(self) -> bool:
+        """
+        저장소가 있으면 pull, 없으면 clone
+
+        Returns:
+            성공 여부
+        """
+        if self.repo_path.exists():
+            return self.pull() is not None
+        else:
+            return self.clone()
+
+    def clone(self) -> bool:
+        """
+        저장소 클론
+
+        Returns:
+            성공 여부
+        """
+        start_time = time.time()
+        logger.info("[GIT] Starting repository clone", extra={
+            "repo_url": os.getenv("BLOG_REPO_URL", ""),
+            "target_path": str(self.repo_path)
+        })
+
+        try:
+            self.repo_path.parent.mkdir(parents=True, exist_ok=True)
+            repo_url = os.getenv("BLOG_REPO_URL", "https://github.com/yarang/blogs.git")
+            result = subprocess.run(
+                ["git", "clone", repo_url, str(self.repo_path)],
+                capture_output=True, text=True, timeout=120
+            )
+
+            elapsed = time.time() - start_time
+
+            if result.returncode == 0:
+                logger.info("[GIT] Repository cloned successfully", extra={
+                    "repo_path": str(self.repo_path),
+                    "duration_sec": round(elapsed, 2)
+                })
+                return True
+
+            logger.error("[GIT] Repository clone failed", extra={
+                "stderr": result.stderr,
+                "duration_sec": round(elapsed, 2)
+            })
+            return False
+
+        except subprocess.TimeoutExpired:
+            logger.error("[GIT] Repository clone timeout", extra={"timeout_sec": 120})
+            return False
+        except Exception as e:
+            logger.error("[GIT] Repository clone error", extra={"error": str(e)}, exc_info=True)
+            return False
+
+    def pull(self) -> Optional[bool]:
+        """
+        최신 내용 가져오기 (pull)
+
+        Returns:
+            성공 시 True, 실패 시 False, 에러 시 None
+        """
+        start_time = time.time()
+        logger.info("[GIT] Starting git pull", extra={"repo_path": str(self.repo_path)})
+
+        code, stdout, stderr = self._run_git("pull", "origin", "main")
+
+        elapsed = time.time() - start_time
+        elapsed_ms = round(elapsed * 1000, 2)
+
+        if code == 0:
+            has_changes = "Already up to date" not in stdout
+            logger.info(f"[GIT] Git pull completed ({elapsed_ms}ms)", extra={
+                "repo_path": str(self.repo_path),
+                "has_changes": has_changes,
+                "stdout": stdout[:200] if stdout else ""
+            })
+            return True
+
+        logger.warning(f"[GIT] Git pull failed ({elapsed_ms}ms)", extra={
+            "stderr": stderr,
+            "stdout": stdout[:200] if stdout else ""
+        })
+        return False
 
     def get_status(self) -> Dict[str, Any]:
         """Git 상태 확인"""

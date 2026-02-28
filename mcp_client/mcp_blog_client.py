@@ -322,7 +322,7 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             "auto_push": True
         })
         if result.get("success"):
-            logger.info(f"Post created: {result.get('filename')}", extra={"filename": result.get("filename")})
+            logger.info(f"Post created: {result.get('filename')}", extra={"post_filename": result.get("filename")})
 
     elif name == "blog_list":
         result = await client.request("GET", "/posts", params={

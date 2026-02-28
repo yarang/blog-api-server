@@ -6,6 +6,7 @@ Blog API Server - Block 1: 독립 Git 관리
 
 import os
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import Optional, List
 
@@ -15,14 +16,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-from dotenv import load_dotenv
-
 from logger_config import setup_logging, get_logger, log_with_context
 from auth import verify_api_key
 from blog_manager import blog_manager
 from git_handler import git_handler
-from translator import translator
+from translator import translator, mermaid_renderer
 from middleware import MonitoringMiddleware
+from api_utils import log_endpoint, ApiResponse
 
 # 환경 변수 로드
 load_dotenv()
@@ -76,8 +76,21 @@ app.add_middleware(
 # 모니터링 미들웨어
 app.add_middleware(MonitoringMiddleware)
 
-# 전역 인스턴스 (모니터링 엔드포인트용)
-_monitoring_middleware = MonitoringMiddleware(app)
+# 미들웨어 인스턴스 (메트릭 조회용)
+_metrics_collector = None
+
+
+def get_metrics_collector():
+    """메트릭 수집기 인스턴스 반환 (지연 초기화)"""
+    global _metrics_collector
+    if _metrics_collector is None:
+        # 첫 번째 미들웨어 인스턴스 찾기
+        for middleware in app.user_middleware:
+            if hasattr(middleware, 'cls') and middleware.cls == MonitoringMiddleware:
+                # 미들웨어가 이미 추가되었으므로 상태 저장용 인스턴스 생성
+                _metrics_collector = MonitoringMiddleware(app)
+                break
+    return _metrics_collector
 
 
 # ============================================================
@@ -116,6 +129,7 @@ async def health():
 
 
 @app.get("/metrics", tags=["Monitoring"])
+@log_endpoint("metrics")
 async def metrics(api_key: str = Depends(verify_api_key)):
     """
     서버 메트릭 (인증 필요)
@@ -127,16 +141,23 @@ async def metrics(api_key: str = Depends(verify_api_key)):
     - error_rate_percent: 에러율
     - slow_request_rate_percent: 느린 요청 비율
     """
-    return _monitoring_middleware.get_stats()
+    collector = get_metrics_collector()
+    if collector:
+        return collector.get_stats()
+    return {"error": "Metrics collector not available"}
 
 
 @app.post("/metrics/reset", tags=["Monitoring"])
+@log_endpoint("reset_metrics")
 async def reset_metrics(api_key: str = Depends(verify_api_key)):
     """
     메트릭 초기화 (인증 필요)
     """
-    _monitoring_middleware.reset_stats()
-    return {"success": True, "message": "Metrics reset"}
+    collector = get_metrics_collector()
+    if collector:
+        collector.reset_stats()
+        return {"success": True, "message": "Metrics reset"}
+    return {"success": False, "error": "Metrics collector not available"}
 
 
 @app.get("/", tags=["System"])
@@ -155,6 +176,7 @@ async def root():
 # ============================================================
 
 @app.get("/posts", tags=["Posts"])
+@log_endpoint("list_posts", log_args=True)
 async def list_posts(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
@@ -162,109 +184,76 @@ async def list_posts(
     api_key: str = Depends(verify_api_key)
 ):
     """포스트 목록"""
-    import time
-    start_time = time.time()
-
-    logger.debug("list_posts endpoint called", extra={
-        "limit": limit,
-        "offset": offset,
-        "language": language
-    })
-
     result = blog_manager.list_posts(limit=limit, offset=offset, language=language)
 
-    elapsed = time.time() - start_time
-    logger.info("list_posts completed", extra={
+    logger.debug("list_posts result", extra={
         "returned_count": len(result.get("posts", [])),
-        "total_count": result.get("total", 0),
-        "duration_ms": round(elapsed * 1000, 2)
+        "total_count": result.get("total", 0)
     })
 
     return result
 
 
 @app.get("/posts/{filename}", tags=["Posts"])
+@log_endpoint("get_post", log_args=True)
 async def get_post(
     filename: str,
     language: Optional[str] = Query(None, pattern="^(ko|en)$"),
     api_key: str = Depends(verify_api_key)
 ):
     """포스트 조회"""
-    import time
-    start_time = time.time()
-
-    logger.debug("get_post endpoint called", extra={
-        "filename": filename,
-        "language": language
-    })
-
     result = blog_manager.get_post(filename, language=language)
 
-    elapsed = time.time() - start_time
-
     if "error" in result:
-        logger.warning("Post not found", extra={
-            "filename": filename,
-            "language": language,
-            "duration_ms": round(elapsed * 1000, 2)
-        })
+        logger.warning("Post not found", extra={"filename": filename, "language": language})
         raise HTTPException(status_code=404, detail=result["error"])
 
-    logger.info("get_post completed", extra={
+    logger.debug("get_post result", extra={
         "filename": filename,
-        "content_length": len(result.get("content", "")),
-        "duration_ms": round(elapsed * 1000, 2)
+        "content_length": len(result.get("content", ""))
     })
 
     return result
 
 
 @app.post("/posts", tags=["Posts"])
+@log_endpoint("create_post", slow_threshold_ms=5000)
 async def create_post(post: PostCreate, api_key: str = Depends(verify_api_key)):
     """포스트 생성 + Git 동기화"""
-    import time
-    start_time = time.time()
+    logger.info("[API] Creating post", extra={
+        "title": post.title[:100],
+        "language": post.language,
+        "draft": post.draft,
+        "auto_push": post.auto_push,
+        "content_length": len(post.content),
+        "tags": post.tags,
+        "categories": post.categories
+    })
 
-    logger.info(f"[API] ========== CREATE POST START ==========")
-    logger.info(f"[API] Title: {post.title[:100]}")
-    logger.info(f"[API] Language: {post.language}, Draft: {post.draft}, AutoPush: {post.auto_push}")
-    logger.info(f"[API] Content length: {len(post.content)} chars")
-    logger.info(f"[API] Tags: {post.tags}, Categories: {post.categories}")
+    result = blog_manager.create_post(
+        title=post.title,
+        content=post.content,
+        tags=post.tags,
+        categories=post.categories,
+        draft=post.draft,
+        auto_push=post.auto_push,
+        language=post.language
+    )
 
-    try:
-        logger.info("[API] Calling blog_manager.create_post...")
-        result = blog_manager.create_post(
-            title=post.title,
-            content=post.content,
-            tags=post.tags,
-            categories=post.categories,
-            draft=post.draft,
-            auto_push=post.auto_push,
-            language=post.language
-        )
+    if not result.get("success"):
+        logger.error("[API] Create post failed", extra={"error": result.get("error")})
+        raise HTTPException(status_code=500, detail=result.get("error"))
 
-        elapsed = time.time() - start_time
-        elapsed_ms = round(elapsed * 1000, 2)
+    logger.info("[API] Post created successfully", extra={
+        "filename": result.get("filename"),
+        "git_success": result.get("git", {}).get("success", False)
+    })
 
-        if not result.get("success"):
-            logger.error(f"[API] CREATE POST FAILED ({elapsed_ms}ms): {result.get('error')}")
-            raise HTTPException(status_code=500, detail=result.get("error"))
-
-        logger.info(f"[API] ========== CREATE POST SUCCESS ({elapsed_ms}ms) ==========")
-        logger.info(f"[API] Filename: {result.get('filename')}")
-        logger.info(f"[API] Git result: {result.get('git')}")
-
-        return result
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        elapsed = time.time() - start_time
-        logger.error(f"[API] CREATE POST EXCEPTION ({round(elapsed * 1000, 2)}ms): {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    return result
 
 
 @app.put("/posts/{filename}", tags=["Posts"])
+@log_endpoint("update_post", log_args=True)
 async def update_post(
     filename: str,
     post: PostUpdate,
@@ -272,10 +261,7 @@ async def update_post(
     api_key: str = Depends(verify_api_key)
 ):
     """포스트 수정"""
-    import time
-    start_time = time.time()
-
-    logger.info("update_post endpoint called", extra={
+    logger.debug("update_post request", extra={
         "filename": filename,
         "language": language,
         "auto_push": post.auto_push,
@@ -289,57 +275,32 @@ async def update_post(
         language=language
     )
 
-    elapsed = time.time() - start_time
-
     if not result.get("success"):
         logger.warning("update_post failed", extra={
             "error": result.get("error"),
-            "filename": filename,
-            "duration_ms": round(elapsed * 1000, 2)
+            "filename": filename
         })
         raise HTTPException(status_code=404, detail=result.get("error"))
-
-    logger.info("update_post completed successfully", extra={
-        "filename": filename,
-        "language": result.get("language"),
-        "duration_ms": round(elapsed * 1000, 2)
-    })
 
     return result
 
 
 @app.delete("/posts/{filename}", tags=["Posts"])
+@log_endpoint("delete_post", log_args=True)
 async def delete_post(
     filename: str,
     language: Optional[str] = Query(None, pattern="^(ko|en)$"),
     api_key: str = Depends(verify_api_key)
 ):
     """포스트 삭제"""
-    import time
-    start_time = time.time()
-
-    logger.info("delete_post endpoint called", extra={
-        "filename": filename,
-        "language": language
-    })
-
     result = blog_manager.delete_post(filename, language=language)
-
-    elapsed = time.time() - start_time
 
     if not result.get("success"):
         logger.warning("delete_post failed", extra={
             "error": result.get("error"),
-            "filename": filename,
-            "duration_ms": round(elapsed * 1000, 2)
+            "filename": filename
         })
         raise HTTPException(status_code=404, detail=result.get("error"))
-
-    logger.info("delete_post completed successfully", extra={
-        "filename": filename,
-        "language": result.get("language"),
-        "duration_ms": round(elapsed * 1000, 2)
-    })
 
     return result
 
@@ -349,24 +310,20 @@ async def delete_post(
 # ============================================================
 
 @app.get("/search", tags=["Search"])
+@log_endpoint("search", log_args=True)
 async def search(
     q: str = Query(..., min_length=1),
     api_key: str = Depends(verify_api_key)
 ):
     """포스트 검색"""
-    import time
-    start_time = time.time()
-
-    logger.info("search endpoint called", extra={"query": q, "query_length": len(q)})
+    logger.debug("search request", extra={"query": q, "query_length": len(q)})
 
     result = blog_manager.search_posts(q)
 
-    elapsed = time.time() - start_time
-    logger.info("search completed", extra={
+    logger.debug("search result", extra={
         "query": q,
         "result_count": result.get("total", 0),
-        "returned_count": len(result.get("results", [])),
-        "duration_ms": round(elapsed * 1000, 2)
+        "returned_count": len(result.get("results", []))
     })
 
     return result
@@ -377,36 +334,18 @@ async def search(
 # ============================================================
 
 @app.post("/sync", tags=["Git"])
+@log_endpoint("sync", slow_threshold_ms=5000)
 async def sync(api_key: str = Depends(verify_api_key)):
     """Git 원격 동기화"""
-    import time
-    start_time = time.time()
-
-    logger.info("sync endpoint called")
-
     result = blog_manager.sync()
-
-    elapsed = time.time() - start_time
-    logger.info("sync completed", extra={
-        "success": result.get("success"),
-        "duration_ms": round(elapsed * 1000, 2)
-    })
-
     return result
 
 
 @app.get("/status", tags=["Git"])
+@log_endpoint("status")
 async def status(api_key: str = Depends(verify_api_key)):
     """Git 상태"""
-    logger.debug("status endpoint called")
-
     result = git_handler.get_status()
-
-    logger.debug("status completed", extra={
-        "clean": result.get("clean"),
-        "change_count": result.get("change_count", 0)
-    })
-
     return result
 
 
@@ -415,25 +354,21 @@ async def status(api_key: str = Depends(verify_api_key)):
 # ============================================================
 
 @app.post("/translate", tags=["Translation"])
+@log_endpoint("translate", slow_threshold_ms=30000)
 async def translate(request: TranslateRequest, api_key: str = Depends(verify_api_key)):
     """LLM 기반 마크다운 번역"""
-    import time
-    start_time = time.time()
-
-    logger.info("translate endpoint called", extra={
-        "source": request.source,
-        "target": request.target,
-        "content_length": len(request.content)
-    })
-
     if request.source == request.target:
-        logger.warning("Same source and target language requested", extra={
-            "language": request.source
-        })
+        logger.warning("Same source and target language requested", extra={"language": request.source})
         raise HTTPException(
             status_code=400,
             detail="Source and target languages must be different"
         )
+
+    logger.debug("translate request", extra={
+        "source": request.source,
+        "target": request.target,
+        "content_length": len(request.content)
+    })
 
     result = translator.translate(
         content=request.content,
@@ -441,37 +376,27 @@ async def translate(request: TranslateRequest, api_key: str = Depends(verify_api
         target=request.target
     )
 
-    elapsed = time.time() - start_time
-
     if not result.get("success"):
-        logger.error("translate failed", extra={
-            "error": result.get("error"),
-            "duration_ms": round(elapsed * 1000, 2)
-        })
+        logger.error("translate failed", extra={"error": result.get("error")})
         raise HTTPException(status_code=500, detail=result.get("error"))
 
-    logger.info("translate completed successfully", extra={
+    logger.debug("translate completed", extra={
         "source": request.source,
         "target": request.target,
-        "result_length": len(result.get("translated", "")),
-        "duration_ms": round(elapsed * 1000, 2)
+        "result_length": len(result.get("translated", ""))
     })
 
     return result
 
 
 @app.post("/translate/sync", tags=["Translation"])
+@log_endpoint("translate_sync", slow_threshold_ms=60000)
 async def translate_sync(api_key: str = Depends(verify_api_key)):
     """
     한국어/영어 포스트 동기화
     - 번역되지 않은 포스트 찾기
     - 자동 번역 후 저장
     """
-    import time
-    start_time = time.time()
-
-    logger.info("translate_sync endpoint called")
-
     if not translator.api_key:
         logger.error("Translation service not configured")
         raise HTTPException(
@@ -481,39 +406,25 @@ async def translate_sync(api_key: str = Depends(verify_api_key)):
 
     result = blog_manager.sync_translations()
 
-    elapsed = time.time() - start_time
     logger.info("translate_sync completed", extra={
         "translated": result.get("summary", {}).get("translated", 0),
-        "failed": result.get("summary", {}).get("failed", 0),
-        "duration_ms": round(elapsed * 1000, 2)
+        "failed": result.get("summary", {}).get("failed", 0)
     })
 
     return result
 
 
 @app.get("/translate/status", tags=["Translation"])
+@log_endpoint("translation_status")
 async def translation_status(api_key: str = Depends(verify_api_key)):
     """번역 상태 확인"""
-    logger.debug("translation_status endpoint called")
-
     result = blog_manager.get_translation_status()
-
-    logger.debug("translation_status completed", extra={
-        "korean_posts": result.get("korean_posts", 0),
-        "english_posts": result.get("english_posts", 0),
-        "needs_translation": result.get("needs_translation_count", 0)
-    })
-
     return result
 
 
 # ============================================================
 # Endpoints: Mermaid Diagram
 # ============================================================
-
-from translator import mermaid_renderer
-from pydantic import BaseModel
-
 
 class MermaidRenderRequest(BaseModel):
     code: str = Field(..., min_length=1, description="Mermaid 다이어그램 코드")
@@ -526,6 +437,7 @@ class MermaidMarkdownRequest(BaseModel):
 
 
 @app.post("/mermaid/render", tags=["Mermaid"])
+@log_endpoint("render_mermaid", slow_threshold_ms=10000)
 async def render_mermaid(request: MermaidRenderRequest, api_key: str = Depends(verify_api_key)):
     """
     Mermaid 코드를 SVG로 렌더링
@@ -542,6 +454,7 @@ async def render_mermaid(request: MermaidRenderRequest, api_key: str = Depends(v
 
 
 @app.post("/mermaid/render-markdown", tags=["Mermaid"])
+@log_endpoint("render_mermaid_in_markdown", slow_threshold_ms=30000)
 async def render_mermaid_in_markdown(request: MermaidMarkdownRequest, api_key: str = Depends(verify_api_key)):
     """
     마크다운의 Mermaid 코드블록을 SVG로 변환
@@ -566,6 +479,7 @@ async def render_mermaid_in_markdown(request: MermaidMarkdownRequest, api_key: s
 
 
 @app.get("/mermaid/status", tags=["Mermaid"])
+@log_endpoint("mermaid_status")
 async def mermaid_status(api_key: str = Depends(verify_api_key)):
     """Mermaid CLI 상태 확인"""
     return {

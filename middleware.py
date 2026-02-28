@@ -237,5 +237,8 @@ class MonitoringMiddleware(BaseHTTPMiddleware):
         self.slow_request_count = 0
 
 
-# 전역 인스턴스
-monitoring_middleware = MonitoringMiddleware
+# 주의: 전역 인스턴스를 생성하지 마세요.
+# FastAPI는 미들웨어를 내부적으로 인스턴스화합니다.
+# 메트릭에 접근하려면 app.user_middleware를 통해 접근하거나,
+# 별도의 메트릭 수집기 인스턴스를 생성하세요.
+# main.py의 get_metrics_collector() 함수를 참고하세요.
