@@ -12,9 +12,11 @@ from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from pathlib import Path
 
 from logger_config import setup_logging, get_logger, log_with_context
 from auth import verify_api_key
@@ -22,6 +24,8 @@ from blog_manager import blog_manager
 from git_handler import git_handler
 from translator import translator, mermaid_renderer
 from middleware import MonitoringMiddleware
+from prometheus_exporter import get_metrics_text, get_metrics_content_type
+from alerting import alert_manager, AlertSeverity
 from api_utils import log_endpoint, ApiResponse
 
 # 환경 변수 로드
@@ -143,7 +147,10 @@ async def metrics(api_key: str = Depends(verify_api_key)):
     """
     collector = get_metrics_collector()
     if collector:
-        return collector.get_stats()
+        stats = collector.get_stats()
+        # 알림 체크
+        alert_manager.check_and_alert(stats)
+        return stats
     return {"error": "Metrics collector not available"}
 
 
@@ -158,6 +165,26 @@ async def reset_metrics(api_key: str = Depends(verify_api_key)):
         collector.reset_stats()
         return {"success": True, "message": "Metrics reset"}
     return {"success": False, "error": "Metrics collector not available"}
+
+
+@app.get("/metrics/prometheus", tags=["Monitoring"])
+async def prometheus_metrics():
+    """
+    Prometheus 형식 메트릭 (인증 불필요 - Prometheus용)
+    """
+    from fastapi.responses import Response
+    return Response(content=get_metrics_text(), media_type=get_metrics_content_type())
+
+
+@app.get("/dashboard", tags=["Monitoring"])
+async def dashboard():
+    """
+    모니터링 대시보드 (인증 불필요)
+    """
+    dashboard_path = Path(__file__).parent / "templates" / "dashboard.html"
+    if dashboard_path.exists():
+        return FileResponse(dashboard_path)
+    return {"error": "Dashboard not found"}
 
 
 @app.get("/", tags=["System"])
@@ -420,6 +447,43 @@ async def translation_status(api_key: str = Depends(verify_api_key)):
     """번역 상태 확인"""
     result = blog_manager.get_translation_status()
     return result
+
+
+# ============================================================
+# Endpoints: Alerting
+# ============================================================
+
+class AlertRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    message: str = Field(..., min_length=1)
+    severity: str = Field("info", pattern="^(info|warning|error|critical)$")
+
+
+@app.get("/alerts/rules", tags=["Alerting"])
+@log_endpoint("get_alert_rules")
+async def get_alert_rules(api_key: str = Depends(verify_api_key)):
+    """알림 규칙 목록"""
+    return {"rules": alert_manager.get_rules()}
+
+
+@app.post("/alerts/send", tags=["Alerting"])
+@log_endpoint("send_alert")
+async def send_alert(alert: AlertRequest, api_key: str = Depends(verify_api_key)):
+    """수동 알림 전송"""
+    severity_map = {
+        "info": AlertSeverity.INFO,
+        "warning": AlertSeverity.WARNING,
+        "error": AlertSeverity.ERROR,
+        "critical": AlertSeverity.CRITICAL
+    }
+
+    alert_manager.send_manual_alert(
+        title=alert.title,
+        message=alert.message,
+        severity=severity_map[alert.severity]
+    )
+
+    return {"success": True, "message": "Alert sent"}
 
 
 # ============================================================

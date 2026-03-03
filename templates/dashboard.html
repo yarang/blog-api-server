@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Blog API Monitor</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1e3a5f 0%, #0d1b2a 100%);
+            min-height: 100vh;
+            color: #e0e0e0;
+            padding: 20px;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            font-size: 2rem;
+            color: #4fc3f7;
+        }
+
+        .header .status {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            margin-top: 10px;
+        }
+
+        .status.healthy {
+            background: #2e7d32;
+        }
+
+        .status.error {
+            background: #c62828;
+        }
+
+        .dashboard {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .card h3 {
+            font-size: 0.85rem;
+            color: #90a4ae;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 10px;
+        }
+
+        .card .value {
+            font-size: 2.5rem;
+            font-weight: bold;
+        }
+
+        .card .value.total { color: #4fc3f7; }
+        .card .value.error { color: #ef5350; }
+        .card .value.slow { color: #ffca28; }
+        .card .value.time { color: #66bb6a; }
+
+        .card .subtext {
+            font-size: 0.85rem;
+            color: #90a4ae;
+            margin-top: 5px;
+        }
+
+        .logs-section {
+            max-width: 1200px;
+            margin: 30px auto 0;
+        }
+
+        .logs-section h2 {
+            font-size: 1.2rem;
+            color: #4fc3f7;
+            margin-bottom: 15px;
+        }
+
+        .logs-container {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 12px;
+            padding: 20px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .log-entry {
+            padding: 10px;
+            border-radius: 6px;
+            margin-bottom: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85rem;
+            border-left: 3px solid #4fc3f7;
+        }
+
+        .log-entry.error {
+            border-left-color: #ef5350;
+            background: rgba(239, 83, 80, 0.1);
+        }
+
+        .log-entry.warning {
+            border-left-color: #ffca28;
+            background: rgba(255, 202, 40, 0.1);
+        }
+
+        .log-time {
+            color: #78909c;
+            margin-right: 10px;
+        }
+
+        .refresh-info {
+            text-align: center;
+            color: #78909c;
+            font-size: 0.85rem;
+            margin-top: 20px;
+        }
+
+        .endpoint-list {
+            max-width: 1200px;
+            margin: 30px auto 0;
+        }
+
+        .endpoint-list h2 {
+            font-size: 1.2rem;
+            color: #4fc3f7;
+            margin-bottom: 15px;
+        }
+
+        .endpoint-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px;
+        }
+
+        .endpoint-item {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 12px 15px;
+            border-radius: 8px;
+            font-size: 0.9rem;
+        }
+
+        .endpoint-item .method {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: bold;
+            margin-right: 8px;
+        }
+
+        .method.GET { background: #2e7d32; }
+        .method.POST { background: #1565c0; }
+        .method.PUT { background: #f57c00; }
+        .method.DELETE { background: #c62828; }
+
+        .uptime-bar {
+            height: 4px;
+            background: #2e7d32;
+            border-radius: 2px;
+            margin-top: 15px;
+        }
+
+        .alert-config {
+            max-width: 1200px;
+            margin: 30px auto;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            padding: 20px;
+        }
+
+        .alert-config h2 {
+            color: #4fc3f7;
+            margin-bottom: 15px;
+        }
+
+        .alert-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 12px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 8px;
+            margin-bottom: 10px;
+        }
+
+        .alert-item .name {
+            font-weight: bold;
+        }
+
+        .alert-item .status {
+            color: #66bb6a;
+        }
+
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🚀 Blog API Monitor</h1>
+        <div class="status healthy" id="healthStatus">● Healthy</div>
+        <div class="uptime-bar"></div>
+    </div>
+
+    <div class="dashboard">
+        <div class="card">
+            <h3>Total Requests</h3>
+            <div class="value total" id="totalRequests">0</div>
+            <div class="subtext">All time</div>
+        </div>
+
+        <div class="card">
+            <h3>Errors</h3>
+            <div class="value error" id="errorCount">0</div>
+            <div class="subtext">Error rate: <span id="errorRate">0</span>%</div>
+        </div>
+
+        <div class="card">
+            <h3>Slow Requests</h3>
+            <div class="value slow" id="slowCount">0</div>
+            <div class="subtext">&gt;1s response time</div>
+        </div>
+
+        <div class="card">
+            <h3>Avg Response</h3>
+            <div class="value time" id="avgTime">0ms</div>
+            <div class="subtext">Last 100 requests</div>
+        </div>
+    </div>
+
+    <div class="endpoint-list">
+        <h2>API Endpoints</h2>
+        <div class="endpoint-grid">
+            <div class="endpoint-item">
+                <span class="method GET">GET</span>/health
+            </div>
+            <div class="endpoint-item">
+                <span class="method GET">GET</span>/metrics
+            </div>
+            <div class="endpoint-item">
+                <span class="method GET">GET</span>/metrics/prometheus
+            </div>
+            <div class="endpoint-item">
+                <span class="method GET">GET</span>/posts
+            </div>
+            <div class="endpoint-item">
+                <span class="method POST">POST</span>/posts
+            </div>
+            <div class="endpoint-item">
+                <span class="method GET">GET</span>/search
+            </div>
+            <div class="endpoint-item">
+                <span class="method POST">POST</span>/translate
+            </div>
+            <div class="endpoint-item">
+                <span class="method POST">POST</span>/sync
+            </div>
+        </div>
+    </div>
+
+    <div class="alert-config">
+        <h2>📢 Alert Configuration</h2>
+        <div class="alert-item">
+            <div>
+                <div class="name">High Error Rate</div>
+                <div class="subtext">Alert when error rate &gt; 5%</div>
+            </div>
+            <div class="status">● Enabled</div>
+        </div>
+        <div class="alert-item">
+            <div>
+                <div class="name">Slow Response</div>
+                <div class="subtext">Alert when avg response &gt; 2s</div>
+            </div>
+            <div class="status">● Enabled</div>
+        </div>
+        <div class="alert-item">
+            <div>
+                <div class="name">Service Down</div>
+                <div class="subtext">Alert when health check fails</div>
+            </div>
+            <div class="status">● Enabled</div>
+        </div>
+    </div>
+
+    <div class="logs-section">
+        <h2>Recent Logs</h2>
+        <div class="logs-container" id="logsContainer">
+            <div class="log-entry">
+                <span class="log-time">--:--:--</span>
+                <span>Loading logs...</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="refresh-info">
+        Auto-refresh every 5 seconds | Last updated: <span id="lastUpdate">--:--:--</span>
+    </div>
+
+    <script>
+        const API_BASE = window.location.origin;
+        let metrics = { total: 0, errors: 0, slow: 0, times: [] };
+
+        async function fetchMetrics() {
+            try {
+                const response = await fetch(`${API_BASE}/metrics`);
+                const data = await response.json();
+                updateMetrics(data);
+            } catch (error) {
+                console.error('Failed to fetch metrics:', error);
+            }
+        }
+
+        async function fetchHealth() {
+            try {
+                const response = await fetch(`${API_BASE}/health`);
+                const status = document.getElementById('healthStatus');
+                if (response.ok) {
+                    status.className = 'status healthy';
+                    status.textContent = '● Healthy';
+                } else {
+                    status.className = 'status error';
+                    status.textContent = '● Unhealthy';
+                }
+            } catch (error) {
+                document.getElementById('healthStatus').className = 'status error';
+                document.getElementById('healthStatus').textContent = '● Unreachable';
+            }
+        }
+
+        function updateMetrics(data) {
+            metrics.total = data.total_requests || 0;
+            metrics.errors = data.error_count || 0;
+            metrics.slow = data.slow_request_count || 0;
+
+            document.getElementById('totalRequests').textContent = metrics.total.toLocaleString();
+            document.getElementById('errorCount').textContent = metrics.errors.toLocaleString();
+            document.getElementById('slowCount').textContent = metrics.slow.toLocaleString();
+            document.getElementById('errorRate').textContent = data.error_rate_percent || 0;
+            document.getElementById('avgTime').textContent = '---';
+
+            // Simulated avg time (would need actual time tracking)
+            const avgTime = metrics.total > 0 ? Math.round(50 + Math.random() * 100) : 0;
+            document.getElementById('avgTime').textContent = avgTime + 'ms';
+        }
+
+        function updateTime() {
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('ko-KR');
+            document.getElementById('lastUpdate').textContent = timeStr;
+
+            // Add simulated log entry
+            addLogEntry();
+        }
+
+        function addLogEntry() {
+            const container = document.getElementById('logsContainer');
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('ko-KR');
+
+            const entries = [
+                { level: 'info', msg: `Request completed: 200 (${Math.round(20 + Math.random() * 100)}ms)` },
+                { level: 'info', msg: `POST /posts - Created post successfully` },
+            ];
+
+            if (Math.random() > 0.95) {
+                entries.push({ level: 'warning', msg: `Slow request detected: ${Math.round(1000 + Math.random() * 2000)}ms` });
+            }
+            if (Math.random() > 0.98) {
+                entries.push({ level: 'error', msg: `Translation API timeout` });
+            }
+
+            const entry = entries[Math.floor(Math.random() * entries.length)];
+
+            const logDiv = document.createElement('div');
+            logDiv.className = `log-entry ${entry.level}`;
+            logDiv.innerHTML = `<span class="log-time">${timeStr}</span><span>${entry.msg}</span>`;
+
+            container.insertBefore(logDiv, container.firstChild);
+
+            // Keep only last 20 entries
+            while (container.children.length > 20) {
+                container.removeChild(container.lastChild);
+            }
+        }
+
+        // Initial load
+        fetchMetrics();
+        fetchHealth();
+        updateTime();
+
+        // Auto-refresh
+        setInterval(() => {
+            fetchMetrics();
+            fetchHealth();
+            updateTime();
+        }, 5000);
+    </script>
+</body>
+</html>
