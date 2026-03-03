@@ -212,7 +212,8 @@ TOOLS = [
                 "content": {"type": "string", "description": "포스트 내용 (Markdown)"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "태그 목록"},
                 "categories": {"type": "array", "items": {"type": "string"}, "description": "카테고리 목록"},
-                "draft": {"type": "boolean", "description": "초안 여부 (기본값: false)"}
+                "draft": {"type": "boolean", "description": "초안 여부 (기본값: false)"},
+                "language": {"type": "string", "description": "언어 (ko, en). 기본값: ko"}
             },
             "required": ["title", "content"]
         }
@@ -319,6 +320,7 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             "tags": arguments.get("tags", []),
             "categories": arguments.get("categories", ["Development"]),
             "draft": arguments.get("draft", False),
+            "language": arguments.get("language", "ko"),
             "auto_push": True
         })
         if result.get("success"):
